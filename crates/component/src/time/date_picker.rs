@@ -837,7 +837,7 @@ impl RenderOnce for DatePicker {
                                                         Size::Large => {
                                                             this.w(px(280.) * month_count)
                                                         }
-                                                        _ => this.w(px(224.) * month_count),
+                                                        _ => this.w(px(252) * month_count),
                                                     })
                                                     .with_size(self.size),
                                             )
