@@ -15,6 +15,7 @@ use gpui::{
     size,
 };
 
+use super::state::ParagraphRows;
 use crate::text::text_view::{LinkClickHandlerFn, handle_link_click};
 
 use super::{
@@ -97,15 +98,20 @@ struct InlineFlowFrameState {
     /// What `layouts` were laid out from. A frame whose items or typography
     /// differ starts over.
     key: Option<FlowLayoutKey>,
-    /// The layouts of `key`, one per wrap width the flow was measured at:
-    /// taffy probes a flow at more than one width in a frame (unconstrained,
-    /// then the column's). A frame that changes nothing finds every width
-    /// here and wraps and shapes nothing.
+    /// The layouts of `key`, one per wrap width the flow was measured at,
+    /// least recently used first. A frame that changes nothing finds every
+    /// width here and wraps and shapes nothing; a resize replaces the
+    /// widths it changes, not the ones still measured.
     layouts: Vec<Rc<InlineFlowLayout>>,
 }
 
-/// How many wrap widths a flow keeps a layout for.
-const LAYOUTS_PER_FLOW: usize = 3;
+/// How many wrap widths a flow keeps a layout for. In one frame taffy
+/// measures a flow at up to four: unconstrained, at its max-content width,
+/// at its container's width and, in a box that shrinks to its text, at the
+/// width it shrinks to. The same document shown twice shares the first two
+/// and adds two of its own. A frame that measures more widths than are kept
+/// evicts each one before it is measured again, and finds none.
+const LAYOUTS_PER_FLOW: usize = 6;
 
 impl InlineFlowFrameState {
     fn fragment_state(&mut self, fragment_ix: usize) -> Arc<Mutex<InlineState>> {
@@ -128,16 +134,20 @@ impl InlineFlowFrameState {
         self.key = Some(key);
     }
 
-    /// The layout at `wrap_width`, if the key was laid out there already.
-    fn layout_at(&self, wrap_width: Option<Pixels>) -> Option<Rc<InlineFlowLayout>> {
-        self.layouts
+    /// The layout at `wrap_width`, if the key was laid out there already,
+    /// which becomes the most recently used.
+    fn layout_at(&mut self, wrap_width: Option<Pixels>) -> Option<Rc<InlineFlowLayout>> {
+        let ix = self
+            .layouts
             .iter()
-            .find(|layout| layout.wrap_width == wrap_width)
-            .cloned()
+            .position(|layout| layout.wrap_width == wrap_width)?;
+        self.layouts[ix..].rotate_left(1);
+        self.layouts.last().cloned()
     }
 
-    /// Keeps `layout`, in place of the oldest one when the flow has been
-    /// measured at more widths than it keeps.
+    /// Keeps `layout` as the most recently used, in place of the least
+    /// recently used when the flow has been measured at more widths than it
+    /// keeps.
     fn push_layout(&mut self, layout: Rc<InlineFlowLayout>) {
         if self.layouts.len() >= LAYOUTS_PER_FLOW {
             self.layouts.remove(0);
@@ -208,6 +218,41 @@ enum PositionedFragment {
         origin: gpui::Point<Pixels>,
         size: Size<Pixels>,
     },
+}
+
+/// The union of the flow's rows, in window coordinates, spanning the flow's
+/// width, with the heights of its first and last rows.
+fn paragraph_rows(fragments: &[PositionedFragment], bounds: Bounds<Pixels>) -> ParagraphRows {
+    let rows = fragments.iter().filter_map(|fragment| match fragment {
+        PositionedFragment::Object {
+            selection_bounds, ..
+        }
+        | PositionedFragment::Text {
+            selection_bounds, ..
+        } => Some(*selection_bounds),
+        PositionedFragment::Image { .. } => None,
+    });
+    let mut first: Option<Bounds<Pixels>> = None;
+    let mut last: Option<Bounds<Pixels>> = None;
+    for row in rows {
+        if first.is_none_or(|first| row.top() < first.top()) {
+            first = Some(row);
+        }
+        if last.is_none_or(|last| row.bottom() > last.bottom()) {
+            last = Some(row);
+        }
+    }
+    let (Some(first), Some(last)) = (first, last) else {
+        return ParagraphRows::single(bounds);
+    };
+    ParagraphRows {
+        bounds: Bounds::from_corners(
+            point(bounds.left(), bounds.top() + first.top()),
+            point(bounds.right(), bounds.top() + last.bottom()),
+        ),
+        first_row_height: first.size.height,
+        last_row_height: last.size.height,
+    }
 }
 
 enum MeasureItem {
@@ -340,6 +385,7 @@ impl InlineFlow {
     }
 }
 
+#[cfg(not(feature = "gpui-fast"))]
 impl IntoElement for InlineFlow {
     type Element = Self;
 
@@ -568,6 +614,9 @@ impl Element for InlineFlow {
             overlays
         };
 
+        // A triple click anywhere in the flow selects the whole paragraph,
+        // every row of it, as it does in a paragraph of plain text.
+        let paragraph_rows = paragraph_rows(&layout.fragments, bounds);
         let mut text_fragment_count = 0;
         for (fragment_ix, fragment) in layout.fragments.iter().enumerate() {
             match fragment {
@@ -601,10 +650,7 @@ impl Element for InlineFlow {
                             bounds.origin + selection_bounds.origin,
                             selection_bounds.size,
                         ),
-                        Bounds::new(
-                            point(bounds.left(), bounds.top() + selection_bounds.top()),
-                            size(bounds.size.width, selection_bounds.size.height),
-                        ),
+                        paragraph_rows,
                     )
                     .link(link.clone(), self.link_click_handler.clone())
                     .into_any_element();
@@ -693,6 +739,7 @@ impl Element for InlineFlow {
                             point(bounds.left(), bounds.top() + selection_bounds.top()),
                             size(bounds.size.width, selection_bounds.size.height),
                         ))
+                        .paragraph_rows(paragraph_rows)
                         .paint_origin(bounds.origin + origin + point(insets.left, insets.top))
                         .into_any_element();
                     // The `Inline` is its own layout root, with no box around
@@ -1676,16 +1723,17 @@ fn push_text_wrap_fragments<'a>(
         if width <= wrap_width {
             fragments.push(WrapLineFragment::element(width, span.len()));
         } else {
+            // The insets wrap each line of the span, not each piece of it, so
+            // the pieces go in without them and `line_ranges` shrinks a line
+            // that comes out too wide once its insets are added.
             for word in span.split_word_bounds() {
-                let width = measure(word) + padding;
-                if width <= wrap_width {
+                let width = measure(word);
+                if width + padding <= wrap_width {
                     fragments.push(WrapLineFragment::element(width, word.len()));
                 } else {
                     for grapheme in word.graphemes(true) {
-                        fragments.push(WrapLineFragment::element(
-                            measure(grapheme) + padding,
-                            grapheme.len(),
-                        ));
+                        fragments
+                            .push(WrapLineFragment::element(measure(grapheme), grapheme.len()));
                     }
                 }
             }
@@ -1854,6 +1902,35 @@ mod tests {
             }
         }
 
+        /// The same answer in a bubble per width, each shrinking to its text,
+        /// as a chat lays out a reply. Two bubbles share the flow's layouts:
+        /// nothing between them carries an id.
+        struct Bubbles {
+            state: Entity<TextViewState>,
+            widths: Vec<Pixels>,
+        }
+
+        impl Render for Bubbles {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .flex()
+                    .size_full()
+                    .children(self.widths.iter().map(|width| {
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_start()
+                            .max_w(*width)
+                            .child(TextView::new(&self.state))
+                    }))
+            }
+        }
+
+        /// Wraps in a 300px bubble, and its longest line is narrower than
+        /// the bubble, so the bubble shrinks to it.
+        const BUBBLE_ANSWER: &str = "Call `foo` now, then **bold** the result and pass \
+            it to `bar` before the next frame lays the answer out once more.";
+
         fn draw(cx: &mut VisualTestContext) {
             cx.update(|window, cx| window.draw(cx).clear(cx));
         }
@@ -1881,6 +1958,37 @@ mod tests {
             }
 
             assert_eq!(layouts(), after_first_frame, "a frame that changes nothing");
+        }
+
+        fn assert_bubbles_are_not_laid_out_again(widths: Vec<Pixels>, cx: &mut TestAppContext) {
+            cx.update(crate::init);
+            let (_, cx) = cx.add_window_view(|_, cx| Bubbles {
+                state: cx.new(|cx| TextViewState::markdown(BUBBLE_ANSWER, cx)),
+                widths,
+            });
+            cx.run_until_parked();
+            draw(cx);
+            let after_first_frame = layouts();
+
+            for _ in 0..3 {
+                draw(cx);
+            }
+
+            assert_eq!(layouts(), after_first_frame, "a frame that changes nothing");
+        }
+
+        /// A bubble that shrinks to its text has taffy measure the flow at
+        /// four widths a frame: unconstrained, at its max-content width, at
+        /// the bubble's width, and at the width it shrinks to.
+        #[gpui::test]
+        fn a_flow_that_shrinks_to_its_text_is_not_laid_out_again(cx: &mut TestAppContext) {
+            assert_bubbles_are_not_laid_out_again(vec![px(300.)], cx);
+        }
+
+        /// The second bubble shares the first two widths and adds two more.
+        #[gpui::test]
+        fn a_flow_shown_twice_is_not_laid_out_again(cx: &mut TestAppContext) {
+            assert_bubbles_are_not_laid_out_again(vec![px(300.), px(220.)], cx);
         }
 
         #[gpui::test]
@@ -1924,6 +2032,31 @@ mod tests {
 
             assert!(layouts() > before, "a new text has a new layout");
         }
+    }
+
+    /// A resize changes the column's width every frame: the widths still
+    /// measured (unconstrained, max-content) stay, the stale ones go.
+    #[test]
+    fn a_flow_keeps_the_widths_it_used_last() {
+        let measured_at = |width: usize| {
+            Rc::new(InlineFlowLayout {
+                wrap_width: Some(px(width as f32)),
+                ..Default::default()
+            })
+        };
+        let mut state = InlineFlowFrameState::default();
+        for width in 0..LAYOUTS_PER_FLOW {
+            state.push_layout(measured_at(width));
+        }
+
+        assert!(state.layout_at(Some(px(0.))).is_some());
+        state.push_layout(measured_at(LAYOUTS_PER_FLOW));
+
+        assert!(state.layout_at(Some(px(0.))).is_some(), "a width in use");
+        assert!(
+            state.layout_at(Some(px(1.))).is_none(),
+            "the least recently used"
+        );
     }
 
     #[test]
@@ -2212,6 +2345,66 @@ mod tests {
                 })
                 .collect();
             assert_eq!(reconstructed, text);
+        }
+    }
+
+    /// An oversized code word counts its insets once per line, not once per
+    /// character, so it fills each line instead of wrapping at about half.
+    /// Insets wider than a character make the wrapper overfill a line, which
+    /// `line_ranges` then shrinks back to fit.
+    #[test]
+    fn long_inline_code_word_fills_each_line() {
+        use super::super::inline::test_fonts::{BODY, MONO, WideMonoTextSystem};
+        use gpui::{Empty, TestApp};
+
+        let mut app = TestApp::with_text_system(Arc::new(WideMonoTextSystem));
+        let mut window = app.open_window(|_, _| Empty);
+        let font_size = px(10.);
+        let style = TextStyle {
+            font_family: BODY.into(),
+            font_size: AbsoluteLength::Pixels(font_size),
+            ..Default::default()
+        };
+        let text = "0123456789abcdefghijklmnopqrstuvwxyz0123";
+        let char_width = WideMonoTextSystem::width_of("0", MONO, font_size);
+
+        for (code_style, padding) in [
+            (None, px(INLINE_CODE_PADDING * 2.)),
+            (Some(StyleRefinement::default().px(px(12.))), px(24.)),
+        ] {
+            let items = vec![MeasureItem::Text {
+                text: text.into(),
+                links: vec![],
+                highlights: vec![(
+                    0..text.len(),
+                    InlineHighlight {
+                        font_family: Some(MONO.into()),
+                        font_size_scale: Some(1.),
+                        code_style,
+                        ..Default::default()
+                    },
+                )],
+            }];
+            let wrap_width = char_width * 9. + padding;
+
+            let layout = window.update(|_, window, cx| {
+                layout_flow(&items, &[None], &style, Some(wrap_width), window, cx)
+            });
+
+            let lines = layout
+                .fragments
+                .iter()
+                .filter_map(|fragment| match fragment {
+                    PositionedFragment::Text { text, .. } => Some(text.as_ref()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                lines,
+                ["012345678", "9abcdefgh", "ijklmnopq", "rstuvwxyz", "0123"],
+                "padding {padding:?}"
+            );
+            assert!(layout.size.width <= wrap_width, "{:?}", layout.size);
         }
     }
 
